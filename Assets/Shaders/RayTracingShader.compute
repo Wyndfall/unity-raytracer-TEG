@@ -8,6 +8,47 @@ static const float PI = 3.14159265f;
 float2 _PixelOffset;
 float4 _DirectionalLight;
 
+float2 _Pixel;
+float _Seed;
+
+float rand()
+{
+    float result = frac(sin(_Seed /100.0f * dot(_Pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+}
+
+float3x3 GetTangentSpace(float3 normal)
+{
+    // Choose a helper vector for the cross product
+    float3 helper = float3(1, 0, 0);
+    if (abs(normal.x) > 0.99f)
+        helper = float3(0, 0, 1);
+    // Generate vectors
+    float3 tangent = normalize(cross(normal, helper));
+    float3 binormal = normalize(cross(normal, tangent));
+    return float3x3(tangent, binormal, normal);
+}
+
+float3 SampleHemisphere(float3 normal)
+{
+    // Uniformly sample hemisphere direction
+    float cosTheta = rand();
+    float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+    float phi = 2 * PI * rand();
+    float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    // Transform direction to world space
+    return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+struct Sphere
+{
+    float3 position;
+    float radius;
+    float3 albedo;
+    float3 specular;
+};
+
+StructuredBuffer<Sphere> _Spheres;
+
 struct Ray
 {
     float3 origin;
@@ -22,11 +63,24 @@ Ray CreateRay(float3 origin, float3 direction)
     ray.energy = float3(1.0f, 1.0f, 1.0f);
     return ray;
 }
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
 struct RayHit
 {
     float3 position;
     float distance;
     float3 normal;
+    float3 specular;
+    float3 albedo;
 };
 RayHit CreateRayHit()
 {
@@ -34,19 +88,9 @@ RayHit CreateRayHit()
     hit.position = float3(0.0f, 0.0f, 0.0f);
     hit.distance = 1.#INF;
     hit.normal = float3(0.0f, 0.0f, 0.0f);
+    hit.specular = float3(0.0f, 0.0f, 0.0f);
+    hit.albedo = float3(0.0f, 0.0f, 0.0f);
     return hit;
-}
-Ray CreateCameraRay(float2 uv)
-{
-    // Transform the camera origin to world space
-    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
-    
-    // Invert the perspective projection of the view-space position
-    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
-    // Transform the direction from camera to world space and normalize
-    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
-    direction = normalize(direction);
-    return CreateRay(origin, direction);
 }
 void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
 {
@@ -57,14 +101,16 @@ void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
         bestHit.distance = t;
         bestHit.position = ray.origin + t * ray.direction;
         bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+        bestHit.specular = 0.04f;
+        bestHit.albedo = 0.5f;
     }
 }
-void IntersectSphere(Ray ray, inout RayHit bestHit, float4 sphere)
+void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
 {
     // Calculate distance along the ray where the sphere is intersected
-    float3 d = ray.origin - sphere.xyz;
+    float3 d = ray.origin - sphere.position;
     float p1 = -dot(ray.direction, d);
-    float p2sqr = p1 * p1 - dot(d, d) + sphere.w * sphere.w;
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
     if (p2sqr < 0)
         return;
     float p2 = sqrt(p2sqr);
@@ -73,27 +119,28 @@ void IntersectSphere(Ray ray, inout RayHit bestHit, float4 sphere)
     {
         bestHit.distance = t;
         bestHit.position = ray.origin + t * ray.direction;
-        bestHit.normal = normalize(bestHit.position - sphere.xyz);
+        bestHit.normal = normalize(bestHit.position - sphere.position);
+        bestHit.albedo = sphere.albedo;
+        bestHit.specular = sphere.specular;
     }
 }
 RayHit Trace(Ray ray)
 {
     RayHit bestHit = CreateRayHit();
     IntersectGroundPlane(ray, bestHit);
-    // Add a floating unit sphere
-    for(int i = 0; i < 8; i++){
-        for(int j = 0; j < 8; j++){
-            IntersectSphere(ray, bestHit, float4(3*i, 3.0f, 3*j, 1.0f));
-        }
-    }
+    // Trace spheres
+    uint numSpheres, stride;
+    _Spheres.GetDimensions(numSpheres, stride);
+    for (uint i = 0; i < numSpheres; i++)
+        IntersectSphere(ray, bestHit, _Spheres[i]);
     return bestHit; 
 }
 float3 Shade(inout Ray ray, RayHit hit)
 {
     if (hit.distance < 1.#INF)
     {
-        float3 specular = float3(0.04f, 0.04f, 0.04f);
-        float3 albedo = float3(0.8f, 0.8f, 0.8f);
+        float3 specular = hit.specular;
+        float3 albedo = hit.albedo;
         // Reflect the ray and multiply energy with specular reflection
         ray.origin = hit.position + hit.normal * 0.001f;
         ray.direction = reflect(ray.direction, hit.normal);
@@ -124,6 +171,7 @@ float3 Shade(inout Ray ray, RayHit hit)
 
 void CSMain (uint3 id : SV_DispatchThreadID)
 {
+    _Pixel = id.xy;
     // Get the dimensions of the RenderTexture
     uint width, height;
     Result.GetDimensions(width, height);
